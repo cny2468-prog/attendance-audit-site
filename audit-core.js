@@ -21,7 +21,8 @@
     return event && reason ? `${event}|${reason}` : '';
   };
   const rowKey = row => `${row.no || row.name}|${row.date}|${row.category}`;
-  const isDateOnlyRecord = row => row.category === '지각|질병' || row.category.startsWith('조퇴|');
+  const PARENT_NICE_REQUIRED = new Set(['결석|질병', '결석|인정', '조퇴|인정', '지각|인정']);
+  const requiresParentNice = row => PARENT_NICE_REQUIRED.has(row.category);
 
   function rowsOf(workbook) {
     return workbook.SheetNames.flatMap(name => {
@@ -318,10 +319,9 @@
     const evidenceMap = new Map(parsed.evidence.map(r => [rowKey(r), r]));
     const baselineMonths = new Set(parsed.monthly.map(r => r.date.slice(0, 7)));
     if (parsed.evidence.length) {
-      for (const [key, r] of monthlyMap) if (!evidenceMap.has(key) && !isDateOnlyRecord(r)) issues.push({ severity: 'error', code: '신고서누락', message: `${r.no}번 ${r.name} ${r.date} ${LABELS[r.category]} 신고가 없습니다.`, detail: '월별 현황에는 있으나 올린 상세 신고서에서 찾지 못했습니다.' });
-      for (const [key, r] of evidenceMap) if (!monthlyMap.has(key) && baselineMonths.has(r.date.slice(0, 7))) {
+      for (const [key, r] of monthlyMap) if (requiresParentNice(r) && !evidenceMap.has(key)) issues.push({ severity: 'error', code: '신고서누락', message: `${r.no}번 ${r.name} ${r.date} ${LABELS[r.category]} 신고가 없습니다.`, detail: '학부모 나이스 대조 대상이지만 올린 신고서에서 찾지 못했습니다.' });
+      for (const [key, r] of evidenceMap) if (requiresParentNice(r) && !monthlyMap.has(key) && baselineMonths.has(r.date.slice(0, 7))) {
         const same = parsed.monthly.find(m => (m.no === r.no || m.name === r.name) && m.date === r.date);
-        if (same && (isDateOnlyRecord(r) || isDateOnlyRecord(same))) continue;
         issues.push({ severity: 'error', code: same ? '구분불일치' : '기준기록누락', message: `${r.no}번 ${r.name} ${r.date} ${LABELS[r.category]} 기록이 기준과 맞지 않습니다.`, detail: same ? `월별 현황: ${LABELS[same.category]} · 신고서: ${LABELS[r.category]}` : `${r.file}에는 있으나 월별 현황에는 없습니다.` });
       }
     } else if (parsed.monthly.length) issues.push({ severity: 'warning', code: '신고서없음', message: '상세 신고서가 없어 날짜별 대조를 건너뛰었습니다.', detail: '' });
@@ -338,5 +338,5 @@
     return { issues, detected, stats: { monthly: parsed.monthly.length, summaryStudents: parsed.summary.length, evidence: parsed.evidence.length, menstrualStudents: menstrual.size, errors, warnings } };
   }
 
-  return { audit, detect, parseMonthly, parseSummary, parseSummaryPdfText, parseAbsence, parseMovement, parseExperience, parseOfficialOdt, parseOdtContent, LABELS };
+  return { audit, detect, parseMonthly, parseSummary, parseSummaryPdfText, parseAbsence, parseMovement, parseExperience, parseOfficialOdt, parseOdtContent, requiresParentNice, LABELS };
 });
