@@ -23,6 +23,19 @@
   const rowKey = row => `${row.no || row.name}|${row.date}|${row.category}`;
   const PARENT_NICE_REQUIRED = new Set(['결석|질병', '결석|인정', '조퇴|인정', '지각|인정']);
   const requiresParentNice = row => PARENT_NICE_REQUIRED.has(row.category);
+  const requiredEvidence = row => {
+    const reason = row.evidenceReason || row.reason || '';
+    if (row.category === '지각|인정' || row.category === '조퇴|인정') return { slots: ['recognized'], code: '인정처리서류누락', label: '인정 지각·조퇴 처리 서류' };
+    if (row.category === '결석|질병') return { slots: ['parent'], code: '신고서누락', label: '질병결석 신고서' };
+    if (row.category !== '결석|인정') return null;
+    if (/체험/.test(reason)) return { slots: ['experience'], code: '체험학습서류누락', label: '체험학습 서류' };
+    if (/대회|훈련|선수단|경기|행사|참가/.test(reason)) return { slots: ['official'], code: '공문누락', label: '출석인정 공문' };
+    return { slots: ['parent'], code: '신고서누락', label: '학부모 나이스 신고서' };
+  };
+  const subjectParticle = value => {
+    const code = String(value || '').trim().charCodeAt(String(value || '').trim().length - 1) - 0xAC00;
+    return code >= 0 && code < 11172 && code % 28 ? '이' : '가';
+  };
 
   function rowsOf(workbook) {
     return workbook.SheetNames.flatMap(name => {
@@ -58,16 +71,20 @@
       const head = rows[h].map(clean);
       const idx = key => head.findIndex(v => v.includes(key));
       const cols = { date: idx('일자'), no: idx('번호'), name: idx('성명'), type: idx('출결구분'), period: idx('결시교시'), reason: idx('사유') };
-      let currentNo = '', currentName = '', currentType = '';
+      let currentNo = '', currentName = '', currentType = '', currentReason = '';
       for (let i = h + 1; i < rows.length; i++) {
         const r = rows[i];
         const d = date(r[cols.date]);
         if (!d) continue;
-        if (clean(r[cols.no])) currentNo = clean(r[cols.no]);
-        if (clean(r[cols.name])) currentName = clean(r[cols.name]);
-        if (clean(r[cols.type])) currentType = clean(r[cols.type]);
+        const nextNo = clean(r[cols.no]), nextName = clean(r[cols.name]), nextType = clean(r[cols.type]);
+        if ((nextNo && nextNo !== currentNo) || (nextName && nextName !== currentName) || (nextType && nextType !== currentType)) currentReason = '';
+        if (nextNo) currentNo = nextNo;
+        if (nextName) currentName = nextName;
+        if (nextType) currentType = nextType;
+        const rowReason = clean(r[cols.reason]);
+        if (rowReason) currentReason = rowReason;
         const cat = category(currentType);
-        const rec = { date: d, no: currentNo, name: currentName, category: cat, type: currentType, period: clean(r[cols.period]), reason: clean(r[cols.reason]), sheet, row: i + 1 };
+        const rec = { date: d, no: currentNo, name: currentName, category: cat, type: currentType, period: clean(r[cols.period]), reason: rowReason, evidenceReason: currentReason, sheet, row: i + 1 };
         if (!currentNo || !currentName) warnings.push({ severity: 'error', code: '기준파일형식', message: `${d} 행에 학생 번호 또는 이름이 없습니다.`, detail: `${sheet} ${i + 1}행` });
         else if (!cat) warnings.push({ severity: 'error', code: '기준파일형식', message: `${currentName} ${d}의 출결구분을 해석할 수 없습니다.`, detail: currentType || '출결구분 빈칸' });
         else records.push(rec);
@@ -254,7 +271,7 @@
       if (input.odtContent) {
         const result = parseOdtContent(input.odtContent, input.classNo);
         detected.push({ name: input.name, slot: input.slot, type: `odt-${result.type}` });
-        if (result.records.length) parsed.evidence.push(...result.records.map(r => ({ ...r, file: input.name })));
+        if (result.records.length) parsed.evidence.push(...result.records.map(r => ({ ...r, file: input.name, slot: input.slot })));
         else issues.push({ severity: 'warning', code: '문서확인', message: `${input.name}에서 자동 대조할 출결 표를 찾지 못했습니다.`, detail: 'ODT의 표에 성명·날짜·출결 구분이 있는지 확인해 주세요.' });
         continue;
       }
@@ -270,7 +287,7 @@
         detected.push({ name: record.file, slot: input.slot || 'manual', type: 'manual' });
         if (!record.name || !record.date || !LABELS[record.category]) {
           issues.push({ severity: 'error', code: '수기기록형식', message: '수기 기록에 학생 이름·날짜·출결 구분을 모두 입력해 주세요.', detail: record.file });
-        } else parsed.evidence.push(record);
+        } else parsed.evidence.push({ ...record, slot: input.slot || 'manual' });
         continue;
       }
       if (!/\.(xlsx?|csv)$/i.test(input.name)) {
@@ -283,14 +300,12 @@
       catch (e) { issues.push({ severity: 'error', code: '파일읽기', message: `${input.name} 파일을 열 수 없습니다.`, detail: e.message }); continue; }
       const type = detect(wb, XLSX);
       detected.push({ name: input.name, slot: input.slot, type });
-      if (input.slot === 'manager' && type !== 'summary') issues.push({ severity: 'error', code: '기준파일형식', message: `${input.name}은 출결업무 담당자 기준 파일 형식이 아닙니다.`, detail: '번호·성명과 결석·지각·조퇴·결과 집계 열이 있는 학급별 월결 출결 집계표를 올려 주세요.' });
-      if (input.slot === 'monthly' && type !== 'monthly') issues.push({ severity: 'error', code: '반별현황형식', message: `${input.name}은 반별 월결 출결 현황 형식이 아닙니다.`, detail: '일자·번호·성명·출결구분 열이 있는 파일을 올려 주세요.' });
       if (type === 'monthly') {
         const result = parseMonthly(wb, XLSX); parsed.monthly.push(...result.records); issues.push(...result.warnings);
       } else if (type === 'summary') parsed.summary.push(...parseSummary(wb, XLSX));
-      else if (type === 'absence') parsed.evidence.push(...parseAbsence(wb, XLSX).map(r => ({ ...r, file: input.name })));
-      else if (type === 'movement') parsed.evidence.push(...parseMovement(wb, XLSX).map(r => ({ ...r, file: input.name })));
-      else if (type === 'experience') parsed.evidence.push(...parseExperience(wb, XLSX).map(r => ({ ...r, file: input.name })));
+      else if (type === 'absence') parsed.evidence.push(...parseAbsence(wb, XLSX).map(r => ({ ...r, file: input.name, slot: input.slot })));
+      else if (type === 'movement') parsed.evidence.push(...parseMovement(wb, XLSX).map(r => ({ ...r, file: input.name, slot: input.slot })));
+      else if (type === 'experience') parsed.evidence.push(...parseExperience(wb, XLSX).map(r => ({ ...r, file: input.name, slot: input.slot })));
       else issues.push({ severity: 'warning', code: '형식미지원', message: `${input.name}에서 비교 가능한 표를 찾지 못했습니다.`, detail: '보관은 가능하지만 자동 대조에서는 제외됩니다.' });
     }
     parsed.monthly = [...new Map(parsed.monthly.map(record => [rowKey(record), record])).values()];
@@ -319,7 +334,12 @@
     const evidenceMap = new Map(parsed.evidence.map(r => [rowKey(r), r]));
     const baselineMonths = new Set(parsed.monthly.map(r => r.date.slice(0, 7)));
     if (parsed.evidence.length) {
-      for (const [key, r] of monthlyMap) if (requiresParentNice(r) && !evidenceMap.has(key)) issues.push({ severity: 'error', code: '신고서누락', message: `${r.no}번 ${r.name} ${r.date} ${LABELS[r.category]} 신고가 없습니다.`, detail: '학부모 나이스 대조 대상이지만 올린 신고서에서 찾지 못했습니다.' });
+      for (const r of monthlyMap.values()) {
+        const needed = requiredEvidence(r);
+        if (!needed) continue;
+        const matched = parsed.evidence.some(e => rowKey(e) === rowKey(r) && (needed.slots.includes(e.slot) || e.slot === 'manual'));
+        if (!matched) issues.push({ severity: 'error', code: needed.code, message: `${r.no}번 ${r.name} ${r.date} ${needed.label}${subjectParticle(needed.label)} 없습니다.`, detail: `사유: ${r.evidenceReason || r.reason || LABELS[r.category]}` });
+      }
       for (const [key, r] of evidenceMap) if (requiresParentNice(r) && !monthlyMap.has(key) && baselineMonths.has(r.date.slice(0, 7))) {
         const same = parsed.monthly.find(m => (m.no === r.no || m.name === r.name) && m.date === r.date);
         issues.push({ severity: 'error', code: same ? '구분불일치' : '기준기록누락', message: `${r.no}번 ${r.name} ${r.date} ${LABELS[r.category]} 기록이 기준과 맞지 않습니다.`, detail: same ? `월별 현황: ${LABELS[same.category]} · 신고서: ${LABELS[r.category]}` : `${r.file}에는 있으나 월별 현황에는 없습니다.` });
